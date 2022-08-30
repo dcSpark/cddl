@@ -1365,13 +1365,18 @@ impl<'a> Parser<'a> {
         #[cfg(not(feature = "ast-comments"))]
         let group = self.parse_group()?;
 
+        // if the group starts with a multi-line comment,
+        // we take the first comment inside the 1st group to be comments_before_group
         #[cfg(feature = "ast-comments")]
         let comments_before_group = if let Some(GroupChoice {
           comments_before_grpchoice,
           ..
         }) = group.group_choices.first_mut()
         {
-          comments_before_grpchoice.take()
+          comments_before_grpchoice
+            .as_mut()
+            .and_then(|comments| if comments.0.len() > 1 { Some(comments.0.remove(0)) } else { None })
+            .map(|comment| Comments(vec![comment]))
         } else {
           None
         };
@@ -1411,17 +1416,18 @@ impl<'a> Parser<'a> {
         #[cfg(not(feature = "ast-comments"))]
         let group = self.parse_group()?;
 
+        // if the group starts with a multi-line comment,
+        // we take the first comment inside the 1st group to be comments_before_group
         #[cfg(feature = "ast-comments")]
         let comments_before_group = if let Some(GroupChoice {
           comments_before_grpchoice,
           ..
         }) = group.group_choices.first_mut()
         {
-          if comments_before_grpchoice.is_some() {
-            comments_before_grpchoice.take()
-          } else {
-            None
-          }
+          comments_before_grpchoice
+            .as_mut()
+            .and_then(|comments| if comments.0.len() > 1 { Some(comments.0.remove(0)) } else { None })
+            .map(|comment| Comments(vec![comment]))
         } else {
           None
         };
@@ -1834,14 +1840,14 @@ impl<'a> Parser<'a> {
       {
         grpchoice.span.0 = self.lexer_position.range.0;
       }
-    };
 
-    #[cfg(feature = "ast-comments")]
-    {
-      grpchoice.comments_before_grpchoice = self.collect_comments()?;
-    }
-    #[cfg(not(feature = "ast-comments"))]
-    self.advance_newline()?;
+      #[cfg(feature = "ast-comments")]
+      {
+        grpchoice.comments_before_grpchoice = self.collect_comments()?;
+      }
+      #[cfg(not(feature = "ast-comments"))]
+      self.advance_newline()?;
+    };
 
     // TODO: The logic in this while loop is quite messy. Need to figure out a
     // better way to advance the token when parsing the entries in a group
