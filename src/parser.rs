@@ -608,7 +608,7 @@ impl<'a> Parser<'a> {
           );
 
           #[cfg(feature = "ast-comments")]
-          let comments_after_rule = if let Some(comments) = t.comments_after_type() {
+          let comments_after_rule = if let Some(comments) = t.split_comments_after_type() {
             Some(comments)
           } else {
             self.collect_comments()?
@@ -754,7 +754,7 @@ impl<'a> Parser<'a> {
         }
 
         #[cfg(feature = "ast-comments")]
-        let comments_after_rule = if let Some(comments) = t.comments_after_type() {
+        let comments_after_rule = if let Some(comments) = t.split_comments_after_type() {
           Some(comments)
         } else {
           self.collect_comments()?
@@ -2033,7 +2033,7 @@ impl<'a> Parser<'a> {
         }
 
         #[cfg(feature = "ast-comments")]
-        let trailing_comments = entry_type.comments_after_type();
+        let trailing_comments = entry_type.take_comments_after_type();
 
         #[cfg(feature = "ast-span")]
         if let Some((name, generic_args, _)) = entry_type.groupname_entry() {
@@ -2102,7 +2102,7 @@ impl<'a> Parser<'a> {
         }
 
         #[cfg(feature = "ast-comments")]
-        let trailing_comments = if let Some(comments) = entry_type.comments_after_type() {
+        let trailing_comments = if let Some(comments) = entry_type.split_comments_after_type() {
           Some(comments)
         } else {
           comments_after_type_or_group
@@ -2186,7 +2186,7 @@ impl<'a> Parser<'a> {
         let entry_type = self.parse_type(None)?;
 
         #[cfg(feature = "ast-comments")]
-        let trailing_comments = entry_type.comments_after_type();
+        let trailing_comments = entry_type.split_comments_after_type();
 
         #[cfg(feature = "ast-span")]
         {
@@ -2258,7 +2258,7 @@ impl<'a> Parser<'a> {
         }
 
         #[cfg(feature = "ast-comments")]
-        let trailing_comments = if let Some(comments) = entry_type.comments_after_type() {
+        let trailing_comments = if let Some(comments) = entry_type.take_comments_after_type() {
           Some(comments)
         } else {
           self.collect_comments()?
