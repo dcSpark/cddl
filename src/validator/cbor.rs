@@ -3802,9 +3802,17 @@ where
       }
     }
 
-    // Handle standard prelude tagged types (decfrac, bigfloat) through the generic TaggedData path
+    // Handle standard prelude tagged types through the generic TaggedData
+    // path. tdate and time retain their additional value checks below, while
+    // bigint, integer, and unsigned are prelude unions handled by the bignum
+    // branch in the Value::Tag arm.
     let token = lookup_ident(ident.ident);
     if let Token::DECFRAC | Token::BIGFLOAT = token {
+      if let Some(tagged_data_type) = tag_from_token(&token) {
+        return self.visit_type2(&tagged_data_type);
+      }
+    }
+    if matches!(&self.cbor, Value::Tag(_, _)) && !matches!(token, Token::TDATE | Token::TIME) {
       if let Some(tagged_data_type) = tag_from_token(&token) {
         return self.visit_type2(&tagged_data_type);
       }
@@ -3892,8 +3900,17 @@ where
         Ok(())
       }
       Value::Tag(tag, value) => {
-        if is_ident_bignum_data_type(self.state.cddl, ident) {
-          if !(ident_accepts_bignum_tag(self.state.cddl, ident, *tag)
+        let prelude_union_accepts_tag = match token {
+          Token::UNSIGNED => *tag == 2,
+          Token::INTEGER => *tag == 2 || *tag == 3,
+          _ => false,
+        };
+
+        if is_ident_bignum_data_type(self.state.cddl, ident)
+          || matches!(token, Token::UNSIGNED | Token::INTEGER)
+        {
+          if !((ident_accepts_bignum_tag(self.state.cddl, ident, *tag)
+            || prelude_union_accepts_tag)
             && matches!(value.as_ref(), Value::Bytes(_)))
           {
             self.add_error(format!("expected type {}, got {:?}", ident, self.cbor));
@@ -3942,7 +3959,7 @@ where
               self.add_error(format!("expected type {}, got {:?}", ident, self.cbor));
             }
           }
-          _ => (),
+          _ => self.add_error(format!("expected type {}, got {:?}", ident, self.cbor)),
         }
 
         Ok(())
