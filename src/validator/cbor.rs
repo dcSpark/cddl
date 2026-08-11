@@ -1117,7 +1117,12 @@ impl<'a> CBORValidator<'a> {
   where
     cbor::Error<T>: From<cbor::Error<std::io::Error>>,
   {
-    if group.group_choices.len() > 1 {
+    let map_choice_paths = map_keys.map(|_| map_group_choice_entry_paths(self.state.cddl, group));
+    if group.group_choices.len() > 1
+      || map_choice_paths
+        .as_ref()
+        .is_some_and(|paths| paths.len() > 1)
+    {
       self.state.is_multi_group_choice = true;
     }
 
@@ -1155,39 +1160,51 @@ impl<'a> CBORValidator<'a> {
     let checkpoint = self.clone();
     let mut choice_errors = Vec::new();
 
+    if let Some(map_choice_paths) = map_choice_paths {
+      for entries in map_choice_paths {
+        let mut candidate = checkpoint.clone();
+        candidate.errors.truncate(initial_error_count);
+        let error_count = candidate.errors.len();
+        for path_entry in entries {
+          let previous_eval = candidate
+            .state
+            .enter_map_group_path_context(&path_entry.generic_contexts);
+          let result = candidate.visit_group_entry(path_entry.entry);
+          candidate.state.leave_map_group_path_context(previous_eval);
+          result?;
+        }
+
+        if candidate.errors.len() == error_count {
+          for (entry_index, key) in map_keys
+            .expect("map choice paths require map keys")
+            .iter()
+            .enumerate()
+          {
+            if Self::is_unconsumed_map_entry(entry_index, &candidate.claimed_map_entries) {
+              candidate.add_error(format!("unexpected key {:?}", key));
+            }
+          }
+        }
+
+        if candidate.errors.len() == error_count {
+          *self = candidate;
+          return Ok(());
+        }
+
+        choice_errors.extend(candidate.errors.into_iter().skip(initial_error_count));
+      }
+
+      *self = checkpoint;
+      self.errors.truncate(initial_error_count);
+      self.errors.extend(choice_errors);
+      return Ok(());
+    }
+
     for group_choice in group.group_choices.iter() {
       let mut candidate = checkpoint.clone();
       candidate.errors.truncate(initial_error_count);
       let error_count = candidate.errors.len();
       candidate.visit_group_choice(group_choice)?;
-
-      let mut has_parent_visible_unexpected_key = false;
-      if candidate.errors.len() == error_count {
-        if let Some(keys) = map_keys {
-          for (entry_index, key) in keys.iter().enumerate() {
-            if Self::is_unconsumed_map_entry(entry_index, &candidate.claimed_map_entries) {
-              // Preserve the parent's existing no-retry behavior for an
-              // ordinary unmatched key. Retry only when the new multiplicity
-              // check exposes an equivalent physical pair that the parent's
-              // membership check would have hidden.
-              let has_claimed_equivalent_key = candidate
-                .claimed_map_entries
-                .iter()
-                .filter_map(|claimed_index| keys.get(*claimed_index))
-                .any(|claimed_key| claimed_key == key);
-              if !has_claimed_equivalent_key {
-                has_parent_visible_unexpected_key = true;
-              }
-              candidate.add_error(format!("unexpected key {:?}", key));
-            }
-          }
-        }
-      }
-
-      if has_parent_visible_unexpected_key {
-        *self = candidate;
-        return Ok(());
-      }
 
       if candidate.errors.len() == error_count {
         *self = candidate;

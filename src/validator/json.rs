@@ -934,6 +934,133 @@ impl<'a> JSONValidator<'a> {
       Ok(None)
     }
   }
+
+  fn visit_group_transactional(
+    &mut self,
+    group: &Group<'a>,
+    object_keys: Option<&[String]>,
+  ) -> visitor::Result<Error> {
+    let map_choice_paths =
+      object_keys.map(|_| map_group_choice_entry_paths(self.state.cddl, group));
+    if group.group_choices.len() > 1
+      || map_choice_paths
+        .as_ref()
+        .is_some_and(|paths| paths.len() > 1)
+    {
+      self.state.is_multi_group_choice = true;
+    }
+
+    // Map equality/inequality validation
+    if self.state.is_ctrl_map_equality {
+      if let Some(t) = &self.state.ctrl {
+        if let Value::Object(o) = &self.json {
+          let entry_counts = entry_counts_from_group(self.state.cddl, group);
+
+          let len = o.len();
+          if let ControlOperator::EQ = t {
+            if !validate_entry_count(&entry_counts, len) {
+              for ec in entry_counts.iter() {
+                if let Some(occur) = &ec.entry_occurrence {
+                  self.add_error(format!(
+                    "map equality error. expected object with number of entries per occurrence {}",
+                    occur,
+                  ));
+                } else {
+                  self.add_error(format!(
+                    "map equality error, expected object with length {}, got {}",
+                    ec.count, len
+                  ));
+                }
+              }
+              return Ok(());
+            }
+          } else if let ControlOperator::NE | ControlOperator::DEFAULT = t {
+            if !validate_entry_count(&entry_counts, len) {
+              for ec in entry_counts.iter() {
+                if let Some(occur) = &ec.entry_occurrence {
+                  self.add_error(format!(
+                    "map inequality error. expected object with number of entries not per occurrence {}",
+                    occur,
+                  ));
+                } else {
+                  self.add_error(format!(
+                    "map inequality error, expected object not with length {}, got {}",
+                    ec.count, len
+                  ));
+                }
+              }
+              return Ok(());
+            }
+          }
+        }
+      }
+    }
+
+    self.state.is_ctrl_map_equality = false;
+
+    let initial_error_count = self.errors.len();
+    let checkpoint = self.clone();
+    let mut choice_errors = Vec::new();
+
+    if let Some(map_choice_paths) = map_choice_paths {
+      for entries in map_choice_paths {
+        let mut candidate = checkpoint.clone();
+        candidate.errors.truncate(initial_error_count);
+        let error_count = candidate.errors.len();
+        for path_entry in entries {
+          let previous_eval = candidate
+            .state
+            .enter_map_group_path_context(&path_entry.generic_contexts);
+          let result = candidate.visit_group_entry(path_entry.entry);
+          candidate.state.leave_map_group_path_context(previous_eval);
+          result?;
+        }
+
+        if candidate.errors.len() == error_count {
+          for key in object_keys.expect("map choice paths require object keys") {
+            if !candidate
+              .validated_keys
+              .as_ref()
+              .is_some_and(|validated_keys| validated_keys.contains(key))
+            {
+              candidate.add_error(format!("unexpected key {:?}", key));
+            }
+          }
+        }
+
+        if candidate.errors.len() == error_count {
+          *self = candidate;
+          return Ok(());
+        }
+
+        choice_errors.extend(candidate.errors.into_iter().skip(initial_error_count));
+      }
+
+      *self = checkpoint;
+      self.errors.truncate(initial_error_count);
+      self.errors.extend(choice_errors);
+      return Ok(());
+    }
+
+    for group_choice in group.group_choices.iter() {
+      let mut candidate = checkpoint.clone();
+      candidate.errors.truncate(initial_error_count);
+      let error_count = candidate.errors.len();
+      candidate.visit_group_choice(group_choice)?;
+
+      if candidate.errors.len() == error_count {
+        *self = candidate;
+        return Ok(());
+      }
+
+      choice_errors.extend(candidate.errors.into_iter().skip(initial_error_count));
+    }
+
+    *self = checkpoint;
+    self.errors.truncate(initial_error_count);
+    self.errors.extend(choice_errors);
+    Ok(())
+  }
 }
 
 impl<'a> Validator<'a, '_, Error> for JSONValidator<'a> {
@@ -1177,77 +1304,7 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
   }
 
   fn visit_group(&mut self, g: &Group<'a>) -> visitor::Result<Error> {
-    if g.group_choices.len() > 1 {
-      self.state.is_multi_group_choice = true;
-    }
-
-    // Map equality/inequality validation
-    if self.state.is_ctrl_map_equality {
-      if let Some(t) = &self.state.ctrl {
-        if let Value::Object(o) = &self.json {
-          let entry_counts = entry_counts_from_group(self.state.cddl, g);
-
-          let len = o.len();
-          if let ControlOperator::EQ = t {
-            if !validate_entry_count(&entry_counts, len) {
-              for ec in entry_counts.iter() {
-                if let Some(occur) = &ec.entry_occurrence {
-                  self.add_error(format!(
-                    "map equality error. expected object with number of entries per occurrence {}",
-                    occur,
-                  ));
-                } else {
-                  self.add_error(format!(
-                    "map equality error, expected object with length {}, got {}",
-                    ec.count, len
-                  ));
-                }
-              }
-              return Ok(());
-            }
-          } else if let ControlOperator::NE | ControlOperator::DEFAULT = t {
-            if !validate_entry_count(&entry_counts, len) {
-              for ec in entry_counts.iter() {
-                if let Some(occur) = &ec.entry_occurrence {
-                  self.add_error(format!(
-                    "map inequality error. expected object with number of entries not per occurrence {}",
-                    occur,
-                  ));
-                } else {
-                  self.add_error(format!(
-                    "map inequality error, expected object not with length {}, got {}",
-                    ec.count, len
-                  ));
-                }
-              }
-              return Ok(());
-            }
-          }
-        }
-      }
-    }
-
-    self.state.is_ctrl_map_equality = false;
-
-    let initial_error_count = self.errors.len();
-    for group_choice in g.group_choices.iter() {
-      let error_count = self.errors.len();
-      self.visit_group_choice(group_choice)?;
-      if self.errors.len() == error_count {
-        // Disregard invalid group choice validation errors if one of the
-        // choices validates successfully
-        let group_choice_error_count = self.errors.len() - initial_error_count;
-        if group_choice_error_count > 0 {
-          for _ in 0..group_choice_error_count {
-            self.errors.pop();
-          }
-        }
-
-        return Ok(());
-      }
-    }
-
-    Ok(())
+    self.visit_group_transactional(g, None)
   }
 
   fn visit_group_choice(&mut self, gc: &GroupChoice<'a>) -> visitor::Result<Error> {
@@ -2297,19 +2354,10 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
           #[allow(clippy::needless_collect)]
           let o = o.keys().cloned().collect::<Vec<_>>();
 
-          self.visit_group(group)?;
-
-          // A key is unexpected unless some group entry consumed its complete
-          // key/value pair (validated_keys of None is an empty consumed set).
-          for k in o.into_iter() {
-            if !self
-              .validated_keys
-              .as_ref()
-              .is_some_and(|keys| keys.contains(&k))
-            {
-              self.add_error(format!("unexpected key {:?}", k));
-            }
-          }
+          // A map-group alternative succeeds only after every object entry is
+          // accounted for. An unexpected-key failure retries the next
+          // alternative from the original key-consumption state.
+          self.visit_group_transactional(group, Some(&o))?;
 
           self.state.is_cut_present = false;
           self.cut_value = None;

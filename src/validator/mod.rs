@@ -23,6 +23,160 @@ use crate::{
 use std::collections::HashSet;
 use std::error::Error;
 
+/// Expand occurrence-less inline groups into complete group-choice entry
+/// paths. Map validation uses these paths as transactional alternatives so a
+/// choice nested inside parentheses can be retried after final map coverage
+/// fails. Entries with an occurrence stay intact because expanding an
+/// occurrence requires sequence allocation rather than choice isolation.
+#[derive(Clone)]
+struct MapGroupPathEntry<'a, 'b> {
+  entry: &'b GroupEntry<'a>,
+  generic_contexts: Vec<MapGroupGenericContext<'a>>,
+}
+
+#[derive(Clone)]
+struct MapGroupGenericContext<'a> {
+  name: &'a str,
+  params: Vec<&'a str>,
+  args: Vec<Type1<'a>>,
+}
+
+fn map_group_choice_entry_paths<'a, 'b>(
+  cddl: &'b CDDL<'a>,
+  group: &'b Group<'a>,
+) -> Vec<Vec<MapGroupPathEntry<'a, 'b>>> {
+  map_group_choice_entry_paths_inner(cddl, group, &mut Vec::new(), &mut Vec::new())
+}
+
+fn map_group_choice_entry_paths_inner<'a, 'b>(
+  cddl: &'b CDDL<'a>,
+  group: &'b Group<'a>,
+  active_group_refs: &mut Vec<&'a str>,
+  generic_contexts: &mut Vec<MapGroupGenericContext<'a>>,
+) -> Vec<Vec<MapGroupPathEntry<'a, 'b>>> {
+  let mut group_paths = Vec::new();
+
+  for group_choice in &group.group_choices {
+    let mut choice_paths = vec![Vec::new()];
+
+    for (entry, _) in &group_choice.group_entries {
+      let entry_paths = map_group_entry_paths(cddl, entry, active_group_refs, generic_contexts);
+
+      let mut combined_paths = Vec::new();
+      for prefix in choice_paths {
+        for suffix in &entry_paths {
+          let mut combined = prefix.clone();
+          combined.extend(suffix.iter().cloned());
+          combined_paths.push(combined);
+        }
+      }
+      choice_paths = combined_paths;
+    }
+
+    group_paths.extend(choice_paths);
+  }
+
+  group_paths
+}
+
+fn map_group_entry_paths<'a, 'b>(
+  cddl: &'b CDDL<'a>,
+  entry: &'b GroupEntry<'a>,
+  active_group_refs: &mut Vec<&'a str>,
+  generic_contexts: &mut Vec<MapGroupGenericContext<'a>>,
+) -> Vec<Vec<MapGroupPathEntry<'a, 'b>>> {
+  if let GroupEntry::InlineGroup {
+    occur: None, group, ..
+  } = entry
+  {
+    return map_group_choice_entry_paths_inner(cddl, group, active_group_refs, generic_contexts);
+  }
+
+  let GroupEntry::TypeGroupname { ge, .. } = entry else {
+    return vec![vec![MapGroupPathEntry {
+      entry,
+      generic_contexts: generic_contexts.clone(),
+    }]];
+  };
+
+  if ge.occur.is_some() || active_group_refs.contains(&ge.name.ident) {
+    return vec![vec![MapGroupPathEntry {
+      entry,
+      generic_contexts: generic_contexts.clone(),
+    }]];
+  }
+
+  let Some(group_rule) = cddl.rules.iter().find_map(|rule| match rule {
+    Rule::Group { rule, .. } if rule.name == ge.name && !rule.is_group_choice_alternate => {
+      Some(rule.as_ref())
+    }
+    _ => None,
+  }) else {
+    return vec![vec![MapGroupPathEntry {
+      entry,
+      generic_contexts: generic_contexts.clone(),
+    }]];
+  };
+
+  let generic_context = match (&group_rule.generic_params, &ge.generic_args) {
+    (None, None) => None,
+    (Some(params), Some(args)) if params.params.len() == args.args.len() => {
+      Some(MapGroupGenericContext {
+        name: ge.name.ident,
+        params: params
+          .params
+          .iter()
+          .map(|param| param.param.ident)
+          .collect(),
+        args: args.args.iter().map(|arg| (*arg.arg).clone()).collect(),
+      })
+    }
+    _ => {
+      return vec![vec![MapGroupPathEntry {
+        entry,
+        generic_contexts: generic_contexts.clone(),
+      }]];
+    }
+  };
+
+  active_group_refs.push(ge.name.ident);
+  if let Some(context) = generic_context {
+    generic_contexts.push(context);
+  }
+  let mut paths =
+    map_group_entry_paths(cddl, &group_rule.entry, active_group_refs, generic_contexts);
+  for alternate in cddl.rules.iter().filter_map(|rule| match rule {
+    Rule::Group { rule, .. } if rule.name == ge.name && rule.is_group_choice_alternate => {
+      Some(&rule.entry)
+    }
+    _ => None,
+  }) {
+    paths.extend(map_group_entry_paths(
+      cddl,
+      alternate,
+      active_group_refs,
+      generic_contexts,
+    ));
+  }
+  if group_rule.generic_params.is_some() {
+    generic_contexts.pop();
+  }
+  active_group_refs.pop();
+
+  if paths.len() > 1 {
+    paths
+  } else {
+    // A named group without an actual choice should keep using the existing
+    // child-validator path. Besides avoiding needless expansion, that path
+    // preserves A06's direct-claim replay behavior for ordinary generic
+    // group members.
+    vec![vec![MapGroupPathEntry {
+      entry,
+      generic_contexts: generic_contexts.clone(),
+    }]]
+  }
+}
+
 #[cfg(feature = "cbor")]
 use cbor::CBORValidator;
 #[cfg(feature = "cbor")]
@@ -267,6 +421,39 @@ impl<'a> ValidationState<'a> {
       is_multi_type_choice_type_rule_validating_array: false,
       visited_rules: HashSet::new(),
     }
+  }
+
+  fn enter_map_group_path_context(
+    &mut self,
+    contexts: &[MapGroupGenericContext<'a>],
+  ) -> Option<&'a str> {
+    let previous_eval = self.eval_generic_rule;
+
+    for context in contexts {
+      if let Some(rule) = self
+        .generic_rules
+        .iter_mut()
+        .find(|rule| rule.name == context.name)
+      {
+        rule.params = context.params.clone();
+        rule.args = context.args.clone();
+      } else {
+        self.generic_rules.push(GenericRule {
+          name: context.name,
+          params: context.params.clone(),
+          args: context.args.clone(),
+        });
+      }
+    }
+    if let Some(context) = contexts.last() {
+      self.eval_generic_rule = Some(context.name);
+    }
+
+    previous_eval
+  }
+
+  fn leave_map_group_path_context(&mut self, previous_eval: Option<&'a str>) {
+    self.eval_generic_rule = previous_eval;
   }
 }
 
