@@ -1302,9 +1302,17 @@ where
       } else if let Some(kind) = ident_numeric_kind(self.state.cddl, target_ident) {
         let matches_kind = match kind {
           NumericKind::Int => matches!(self.cbor, Value::Integer(_)),
-          NumericKind::Float => matches!(self.cbor, Value::Float(_)),
+          NumericKind::Float => matches!(
+            &self.cbor,
+            Value::Float(value)
+              if ident_matches_float_value(self.state.cddl, target_ident, *value)
+          ),
           // e.g. number = int / float, which admits both
-          NumericKind::Both => matches!(self.cbor, Value::Integer(_) | Value::Float(_)),
+          NumericKind::Both => match &self.cbor {
+            Value::Integer(_) => true,
+            Value::Float(value) => ident_matches_float_value(self.state.cddl, target_ident, *value),
+            _ => false,
+          },
         };
         if !matches_kind {
           let expected = match kind {
@@ -3431,7 +3439,9 @@ where
         }
       }
       Value::Float(f) => {
-        if ident_numeric_kind(self.state.cddl, ident).is_some_and(NumericKind::admits_float) {
+        if ident_numeric_kind(self.state.cddl, ident).is_some_and(NumericKind::admits_float)
+          && ident_matches_float_value(self.state.cddl, ident, *f)
+        {
           Ok(())
         } else if is_ident_time_data_type(self.state.cddl, ident) {
           if let chrono::LocalResult::None = Utc.timestamp_millis_opt((*f * 1000f64) as i64) {
@@ -3634,7 +3644,13 @@ where
               Some(NumericKind::Float)
             ) && !self.validating_value
             {
-              if let Some((k, v)) = m.iter().find(|(k, _)| matches!(k, Value::Float(_))) {
+              if let Some((k, v)) = m.iter().find(|(k, _)| {
+                matches!(
+                  k,
+                  Value::Float(value)
+                    if primitive_float_ident_matches_value(ident, *value).unwrap_or(true)
+                )
+              }) {
                 self
                   .validated_keys
                   .get_or_insert(vec![k.clone()])
@@ -3778,7 +3794,13 @@ where
               Some(NumericKind::Float)
             ) && !self.validating_value
             {
-              if let Some((k, v)) = m.iter().find(|(k, _)| matches!(k, Value::Float(_))) {
+              if let Some((k, v)) = m.iter().find(|(k, _)| {
+                matches!(
+                  k,
+                  Value::Float(value)
+                    if primitive_float_ident_matches_value(ident, *value).unwrap_or(true)
+                )
+              }) {
                 self
                   .validated_keys
                   .get_or_insert(vec![k.clone()])
@@ -4041,7 +4063,11 @@ where
                     return None;
                   }
 
-                  if matches!(k, Value::Float(_)) {
+                  if matches!(
+                    k,
+                    Value::Float(value)
+                      if primitive_float_ident_matches_value(ident, *value).unwrap_or(true)
+                  ) {
                     matched_keys.push(k.clone());
                     Some(v.clone())
                   } else {
@@ -4303,7 +4329,13 @@ where
               Some(NumericKind::Float)
             ) && !self.validating_value
             {
-              if let Some((k, v)) = m.iter().find(|(k, _)| matches!(k, Value::Float(_))) {
+              if let Some((k, v)) = m.iter().find(|(k, _)| {
+                matches!(
+                  k,
+                  Value::Float(value)
+                    if primitive_float_ident_matches_value(ident, *value).unwrap_or(true)
+                )
+              }) {
                 self
                   .validated_keys
                   .get_or_insert(vec![k.clone()])
