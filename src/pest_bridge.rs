@@ -1827,16 +1827,29 @@ fn convert_cddl<'a>(mut pairs: Pairs<'a, Rule>, input: &'a str) -> Result<ast::C
     });
   }
 
-  // Check for duplicate rule names (non-alternate rules)
+  // Check for duplicate rule names (non-alternate rules). RFC 8610 Appendix
+  // C says `/=` creates the named choice when no plain definition exists, so
+  // a later `=` is a duplicate definition rather than a base to reorder ahead
+  // of the existing choice arms.
   let mut seen_names: HashMap<String, usize> = HashMap::new();
+  let mut incremental_type_names: HashMap<String, usize> = HashMap::new();
   for (idx, rule) in rules.iter().enumerate() {
     let name = rule.name();
     let is_alternate = match rule {
       ast::Rule::Type { rule, .. } => rule.is_type_choice_alternate,
       ast::Rule::Group { rule, .. } => rule.is_group_choice_alternate,
     };
+    if matches!(rule, ast::Rule::Type { .. }) && is_alternate {
+      incremental_type_names.entry(name.clone()).or_insert(idx);
+    }
     if !is_alternate {
-      if let Some(_prev_idx) = seen_names.get(&name) {
+      if let Some(_prev_idx) = seen_names.get(&name).or_else(|| {
+        if matches!(rule, ast::Rule::Type { .. }) {
+          incremental_type_names.get(&name)
+        } else {
+          None
+        }
+      }) {
         return Err(Error::PARSER {
           #[cfg(feature = "ast-span")]
           position: Position::default(),
