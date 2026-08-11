@@ -264,6 +264,65 @@ impl<'a> JSONValidator<'a> {
     }
   }
 
+  /// Match a complete member-key type against the unclaimed string keys of
+  /// the current JSON object.
+  ///
+  /// RFC 8610 Sections 2.1.2 and 3.5 make a map member key a type, not merely
+  /// a primitive identifier. Probe each JSON string key as an ordinary value
+  /// so aliases, choices, controls, and literals share the validator's normal
+  /// Type1 semantics. The enclosing entry still decides which complete
+  /// key/value matches to commit.
+  fn visit_general_member_key_type1(&mut self, t1: &Type1<'a>) -> visitor::Result<Error> {
+    let Value::Object(object) = &self.json else {
+      return self.visit_type1(t1);
+    };
+
+    let unclaimed_entries = object
+      .iter()
+      .filter(|(key, _)| {
+        !self
+          .validated_keys
+          .as_ref()
+          .is_some_and(|keys| keys.contains(*key))
+      })
+      .map(|(key, value)| (key.clone(), value.clone()))
+      .collect::<Vec<_>>();
+
+    let mut matching_entries = Vec::new();
+    for (key, value) in unclaimed_entries {
+      let mut candidate = self.new_with_recursion_state(Value::String(key.clone()));
+      candidate.state.is_multi_type_choice = self.state.is_multi_type_choice;
+      candidate.state.is_multi_group_choice = self.state.is_multi_group_choice;
+      candidate.state.type_group_name_entry = self.state.type_group_name_entry;
+      candidate.visit_type1(t1)?;
+
+      if candidate.errors.is_empty() {
+        matching_entries.push((key, value));
+      }
+    }
+
+    let entry_optional = matches!(self.state.occurrence, Some(Occur::Optional { .. }));
+    if self.state.occurrence.is_none() || entry_optional {
+      if let Some((key, value)) = matching_entries.into_iter().next() {
+        self
+          .validated_keys
+          .get_or_insert_with(Vec::new)
+          .push(key.clone());
+        self.object_value = Some(value);
+        let _ = write!(self.state.data_location, "/{}", key);
+      } else if entry_optional {
+        self.state.occurrence = None;
+        self.state.advance_to_next_entry = true;
+      } else {
+        self.add_error(format!("object requires entry key matching {}", t1));
+      }
+    } else {
+      self.map_entry_candidates = Some(matching_entries);
+    }
+
+    Ok(())
+  }
+
   #[cfg(target_arch = "wasm32")]
   #[cfg(feature = "additional-controls")]
   /// New JSONValidation from CDDL AST and JSON value
@@ -3185,9 +3244,13 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
 
   fn visit_memberkey(&mut self, mk: &MemberKey<'a>) -> visitor::Result<Error> {
     match mk {
-      MemberKey::Type1 { is_cut, .. } => {
+      MemberKey::Type1 { t1, is_cut, .. } => {
         self.state.is_cut_present = *is_cut;
-        walk_memberkey(self, mk)?;
+        if self.state.is_member_key && matches!(self.json, Value::Object(_)) {
+          self.visit_general_member_key_type1(t1)?;
+        } else {
+          self.visit_type1(t1)?;
+        }
         self.state.is_cut_present = false;
       }
       MemberKey::Bareword { .. } => {

@@ -590,6 +590,65 @@ impl<'a> CBORValidator<'a> {
     }
   }
 
+  /// Match a complete member-key type against the unclaimed keys of the
+  /// current CBOR map.
+  ///
+  /// RFC 8610 Sections 2.1.2 and 3.5 make a map member key a type, not merely
+  /// a primitive identifier. Probe each physical key as an ordinary CBOR
+  /// value so aliases, choices, controls, tags, and composite types share the
+  /// validator's normal Type1 semantics. The enclosing entry still decides
+  /// which complete key/value matches to commit.
+  fn visit_general_member_key_type1<T: std::fmt::Debug + 'static>(
+    &mut self,
+    t1: &Type1<'a>,
+  ) -> visitor::Result<Error<T>>
+  where
+    cbor::Error<T>: From<cbor::Error<std::io::Error>>,
+  {
+    let Value::Map(entries) = &self.cbor else {
+      return self.visit_type1(t1);
+    };
+
+    let unclaimed_entries = entries
+      .iter()
+      .enumerate()
+      .filter(|(entry_index, _)| {
+        Self::is_unconsumed_map_entry(*entry_index, &self.claimed_map_entries)
+      })
+      .map(|(entry_index, (key, value))| (entry_index, key.clone(), value.clone()))
+      .collect::<Vec<_>>();
+
+    let mut matching_entries = Vec::new();
+    for (entry_index, key, value) in unclaimed_entries {
+      let mut candidate = self.new_with_recursion_state(key.clone());
+      candidate.state.is_multi_type_choice = self.state.is_multi_type_choice;
+      candidate.state.is_multi_group_choice = self.state.is_multi_group_choice;
+      candidate.state.type_group_name_entry = self.state.type_group_name_entry;
+      candidate.visit_type1(t1)?;
+
+      if candidate.errors.is_empty() {
+        matching_entries.push((entry_index, key, value));
+      }
+    }
+
+    let entry_optional = matches!(self.state.occurrence, Some(Occur::Optional { .. }));
+    if self.state.occurrence.is_none() || entry_optional {
+      let entry = matching_entries.into_iter().next();
+      if !self.claim_single_map_entry(entry, entry_optional) && !entry_optional {
+        self.add_error(format!("map requires entry key matching {}", t1));
+      }
+    } else {
+      self.map_entry_candidates = Some(
+        matching_entries
+          .into_iter()
+          .map(|(entry_index, _, value)| (entry_index, value))
+          .collect(),
+      );
+    }
+
+    Ok(())
+  }
+
   /// Find the first unconsumed map entry for a primitive identifier used as a
   /// non-repeating member key. The outer option indicates whether the
   /// identifier is one of the key domains handled by this fast path.
@@ -4369,9 +4428,13 @@ where
 
   fn visit_memberkey(&mut self, mk: &MemberKey<'a>) -> visitor::Result<Error<T>> {
     match mk {
-      MemberKey::Type1 { is_cut, .. } => {
+      MemberKey::Type1 { t1, is_cut, .. } => {
         self.state.is_cut_present = *is_cut;
-        walk_memberkey(self, mk)?;
+        if self.state.is_member_key && matches!(self.cbor, Value::Map(_)) {
+          self.visit_general_member_key_type1(t1)?;
+        } else {
+          self.visit_type1(t1)?;
+        }
         self.state.is_cut_present = false;
       }
       MemberKey::Bareword { .. } => {
@@ -4714,15 +4777,11 @@ where
                 )
               })
           }
-          _ => Some(format!(
-            "expected value {} {}, got {:?}",
-            self.state.ctrl.unwrap(),
-            t,
-            b
-          )),
+          Some(ctrl) => Some(format!("expected value {} {}, got {:?}", ctrl, t, b)),
+          None => Some(format!("expected text value {:?}, got {:?}", t, b)),
         },
-        #[cfg(feature = "additional-controls")]
         token::Value::BYTE(bv) => match &self.state.ctrl {
+          #[cfg(feature = "additional-controls")]
           Some(ControlOperator::ABNFB) => match bv {
             ByteValue::UTF8(utf8bv) => validate_abnf(
               std::str::from_utf8(utf8bv).map_err(Error::UTF8Parsing)?,
@@ -4764,12 +4823,19 @@ where
               )
             }),
           },
-          _ => Some(format!(
-            "expected value {} {}, got {:?}",
-            self.state.ctrl.unwrap(),
-            bv,
-            b
-          )),
+          Some(ctrl) => Some(format!("expected value {} {:?}, got {:?}", ctrl, bv, b)),
+          None => {
+            let expected = match bv {
+              ByteValue::UTF8(expected) | ByteValue::B16(expected) | ByteValue::B64(expected) => {
+                expected.as_ref()
+              }
+            };
+            if b == expected {
+              None
+            } else {
+              Some(format!("expected byte value {:?}, got {:?}", bv, b))
+            }
+          }
         },
         _ => Some(format!("expected {}, got {:?}", value, b)),
       },
