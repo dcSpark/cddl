@@ -142,6 +142,7 @@ impl<T: std::fmt::Debug> Error<T> {
 #[derive(Clone)]
 struct GenericEvaluationContext<'a> {
   rule_name: &'a str,
+  params: Vec<&'a str>,
   args: Vec<Type1<'a>>,
 }
 
@@ -149,7 +150,7 @@ struct GenericEvaluationContext<'a> {
 struct SingleMapEntryClaim<'a> {
   entry_index: usize,
   entry: Option<ValueMemberKeyEntry<'a>>,
-  generic_context: Option<GenericEvaluationContext<'a>>,
+  generic_context: Option<Vec<GenericEvaluationContext<'a>>>,
 }
 
 /// cbor validator type
@@ -176,6 +177,13 @@ pub struct CBORValidator<'a> {
   // Isolated compatibility probes must not recursively start another map
   // assignment search when the tested pair does not match.
   probing_single_entry_assignment: bool,
+  // Active generic invocations in lexical outer-to-inner order. The shared
+  // generic rule cache is keyed by rule name and therefore cannot distinguish
+  // nesting from earlier sibling invocations.
+  generic_evaluation_stack: Vec<GenericEvaluationContext<'a>>,
+  // While an argument is being evaluated, only frames outside the invocation
+  // which declared that argument are in lexical scope.
+  generic_argument_scope: Option<usize>,
   // Candidate batch produced while visiting one repeating map member's key.
   // `visit_value_member_key_entry` immediately takes this relay field so the
   // physical indices and values cannot affect a later group entry.
@@ -200,6 +208,8 @@ impl<'a> CBORValidator<'a> {
       single_entry_claims: Vec::new(),
       active_single_entry_claim: None,
       probing_single_entry_assignment: false,
+      generic_evaluation_stack: Vec::new(),
+      generic_argument_scope: None,
       map_entry_candidates: None,
       validating_value: false,
       range_upper: None,
@@ -220,6 +230,8 @@ impl<'a> CBORValidator<'a> {
       single_entry_claims: Vec::new(),
       active_single_entry_claim: None,
       probing_single_entry_assignment: false,
+      generic_evaluation_stack: Vec::new(),
+      generic_argument_scope: None,
       map_entry_candidates: None,
       validating_value: false,
       range_upper: None,
@@ -240,6 +252,8 @@ impl<'a> CBORValidator<'a> {
       single_entry_claims: Vec::new(),
       active_single_entry_claim: None,
       probing_single_entry_assignment: false,
+      generic_evaluation_stack: Vec::new(),
+      generic_argument_scope: None,
       map_entry_candidates: None,
       validating_value: false,
       range_upper: None,
@@ -260,6 +274,8 @@ impl<'a> CBORValidator<'a> {
       single_entry_claims: Vec::new(),
       active_single_entry_claim: None,
       probing_single_entry_assignment: false,
+      generic_evaluation_stack: Vec::new(),
+      generic_argument_scope: None,
       map_entry_candidates: None,
       validating_value: false,
       range_upper: None,
@@ -315,6 +331,18 @@ impl<'a> CBORValidator<'a> {
     }
   }
 
+  fn inherit_map_assignment_state(&mut self, parent: &Self) {
+    self.claimed_map_entries = parent.claimed_map_entries.clone();
+    self.single_entry_claims = parent.single_entry_claims.clone();
+    self.active_single_entry_claim = None;
+  }
+
+  fn commit_map_assignment_state(&mut self, child: &mut Self) {
+    self.claimed_map_entries = std::mem::take(&mut child.claimed_map_entries);
+    self.single_entry_claims = std::mem::take(&mut child.single_entry_claims);
+    self.active_single_entry_claim = child.active_single_entry_claim;
+  }
+
   fn member_key_has_cut(entry: &ValueMemberKeyEntry<'a>) -> bool {
     matches!(
       entry.member_key.as_ref(),
@@ -323,25 +351,87 @@ impl<'a> CBORValidator<'a> {
     )
   }
 
-  fn current_generic_evaluation_context(&self) -> Option<GenericEvaluationContext<'a>> {
-    let rule_name = self.state.eval_generic_rule?;
-    let rule = self
-      .state
-      .generic_rules
-      .iter()
-      .find(|rule| rule.name == rule_name)?;
-    let current_args_start = rule.args.len().checked_sub(rule.params.len())?;
+  fn push_generic_evaluation(
+    &mut self,
+    rule_name: &'a str,
+    rule: &'a Rule<'a>,
+    generic_args: &GenericArgs<'a>,
+  ) {
+    if let Some(params) = generic_params_from_rule(rule) {
+      self
+        .generic_evaluation_stack
+        .push(GenericEvaluationContext {
+          rule_name,
+          params,
+          args: generic_args
+            .args
+            .iter()
+            .map(|arg| (*arg.arg).clone())
+            .collect(),
+        });
+      self.generic_argument_scope = None;
+    }
+  }
 
-    Some(GenericEvaluationContext {
-      rule_name,
-      args: rule.args[current_args_start..].to_vec(),
-    })
+  fn current_generic_evaluation_context(&self) -> Option<Vec<GenericEvaluationContext<'a>>> {
+    if self.generic_evaluation_stack.is_empty() {
+      None
+    } else {
+      Some(self.generic_evaluation_stack.clone())
+    }
+  }
+
+  fn restore_generic_evaluation_context(
+    &mut self,
+    generic_context: &[GenericEvaluationContext<'a>],
+  ) {
+    self.generic_evaluation_stack = generic_context.to_vec();
+    self.generic_argument_scope = None;
+    self.state.eval_generic_rule = generic_context.last().map(|context| context.rule_name);
+
+    // Keep the legacy name-keyed cache coherent for validation paths which
+    // have not yet needed lexical stack lookup. The stack remains
+    // authoritative when a rule name occurs more than once.
+    for context in generic_context {
+      if let Some(rule) = self
+        .state
+        .generic_rules
+        .iter_mut()
+        .find(|rule| rule.name == context.rule_name)
+      {
+        rule.params = context.params.clone();
+        rule.args = context.args.clone();
+      } else {
+        self.state.generic_rules.push(GenericRule {
+          name: context.rule_name,
+          params: context.params.clone(),
+          args: context.args.clone(),
+        });
+      }
+    }
+  }
+
+  fn generic_argument_for_identifier(&self, ident: &Identifier<'a>) -> Option<(usize, Type1<'a>)> {
+    let scope = self
+      .generic_argument_scope
+      .unwrap_or(self.generic_evaluation_stack.len());
+
+    for frame_index in (0..scope).rev() {
+      let frame = &self.generic_evaluation_stack[frame_index];
+      if let Some(param_index) = frame.params.iter().position(|param| *param == ident.ident) {
+        if let Some(arg) = frame.args.get(param_index) {
+          return Some((frame_index, arg.clone()));
+        }
+      }
+    }
+
+    None
   }
 
   fn single_pair_validates_entry<T: std::fmt::Debug + 'static>(
     &self,
     entry: &ValueMemberKeyEntry<'a>,
-    generic_context: Option<&GenericEvaluationContext<'a>>,
+    generic_context: Option<&[GenericEvaluationContext<'a>]>,
     key: Value,
     value: Value,
   ) -> std::result::Result<bool, Error<T>>
@@ -349,16 +439,8 @@ impl<'a> CBORValidator<'a> {
     cbor::Error<T>: From<cbor::Error<std::io::Error>>,
   {
     let mut candidate = self.new_with_recursion_state(Value::Map(vec![(key, value)]));
-    candidate.state.eval_generic_rule = generic_context.map(|context| context.rule_name);
     if let Some(context) = generic_context {
-      if let Some(rule) = candidate
-        .state
-        .generic_rules
-        .iter_mut()
-        .find(|rule| rule.name == context.rule_name)
-      {
-        rule.args = context.args.clone();
-      }
+      candidate.restore_generic_evaluation_context(context);
     }
     candidate.state.is_multi_type_choice = self.state.is_multi_type_choice;
     candidate.state.is_multi_group_choice = self.state.is_multi_group_choice;
@@ -410,7 +492,7 @@ impl<'a> CBORValidator<'a> {
     &mut self,
     current_claim_position: usize,
     current_entry: &ValueMemberKeyEntry<'a>,
-    current_generic_context: Option<GenericEvaluationContext<'a>>,
+    current_generic_context: Option<Vec<GenericEvaluationContext<'a>>>,
   ) -> std::result::Result<bool, Error<T>>
   where
     cbor::Error<T>: From<cbor::Error<std::io::Error>>,
@@ -456,13 +538,12 @@ impl<'a> CBORValidator<'a> {
         let (key, value) = entries[*entry_index].clone();
         compatibility[claim_slot][entry_slot] = self.single_pair_validates_entry::<T>(
           entry,
-          claim_generic_contexts[claim_slot].as_ref(),
+          claim_generic_contexts[claim_slot].as_deref(),
           key,
           value,
         )?;
       }
     }
-
     let mut entry_owners = vec![None; entry_indices.len()];
     for claim_slot in 0..claim_positions.len() {
       let mut visited_entries = vec![false; entry_indices.len()];
@@ -697,6 +778,8 @@ impl<'a> CBORValidator<'a> {
 
     cv.state.generic_rules = self.state.generic_rules.clone();
     cv.state.eval_generic_rule = self.state.eval_generic_rule;
+    cv.generic_evaluation_stack = self.generic_evaluation_stack.clone();
+    cv.generic_argument_scope = self.generic_argument_scope;
     cv.state.visited_rules = self.state.visited_rules.clone();
     cv
   }
@@ -970,6 +1053,7 @@ impl<'a> CBORValidator<'a> {
               }
 
               cv.state.eval_generic_rule = Some(ge.name.ident);
+              cv.push_generic_evaluation(ge.name.ident, rule, ga);
               return cv.visit_rule(rule);
             }
           }
@@ -1046,6 +1130,8 @@ impl<'a> CBORValidator<'a> {
     // speculative) descent don't leak into sibling alternatives or later
     // iterations
     let prev_eval = self.state.eval_generic_rule;
+    let prev_generic_stack_len = self.generic_evaluation_stack.len();
+    let prev_generic_argument_scope = self.generic_argument_scope;
     let prev_generic_rules = ge
       .generic_args
       .as_ref()
@@ -1070,6 +1156,7 @@ impl<'a> CBORValidator<'a> {
         }
 
         self.state.eval_generic_rule = Some(ge.name.ident);
+        self.push_generic_evaluation(ge.name.ident, rule, ga);
       }
     }
 
@@ -1087,6 +1174,10 @@ impl<'a> CBORValidator<'a> {
     }
 
     self.state.eval_generic_rule = prev_eval;
+    self
+      .generic_evaluation_stack
+      .truncate(prev_generic_stack_len);
+    self.generic_argument_scope = prev_generic_argument_scope;
     if let Some(prev) = prev_generic_rules {
       self.state.generic_rules = prev;
     }
@@ -1121,6 +1212,8 @@ impl<'a> CBORValidator<'a> {
     // speculative) descent don't leak into sibling alternatives or later
     // iterations
     let prev_eval = self.state.eval_generic_rule;
+    let prev_generic_stack_len = self.generic_evaluation_stack.len();
+    let prev_generic_argument_scope = self.generic_argument_scope;
     let prev_generic_rules = generic_args.map(|_| self.state.generic_rules.clone());
     if let Some(ga) = generic_args {
       if let Some(gr) = self
@@ -1141,6 +1234,7 @@ impl<'a> CBORValidator<'a> {
       }
 
       self.state.eval_generic_rule = Some(ident.ident);
+      self.push_generic_evaluation(ident.ident, rule, ga);
     }
 
     let mut result = None;
@@ -1156,6 +1250,10 @@ impl<'a> CBORValidator<'a> {
     }
 
     self.state.eval_generic_rule = prev_eval;
+    self
+      .generic_evaluation_stack
+      .truncate(prev_generic_stack_len);
+    self.generic_argument_scope = prev_generic_argument_scope;
     if let Some(prev) = prev_generic_rules {
       self.state.generic_rules = prev;
     }
@@ -1469,6 +1567,7 @@ where
         if !choice_validator.state.has_feature_errors
           || choice_validator.state.disabled_features.is_some()
         {
+          self.commit_map_assignment_state(&mut choice_validator);
           // Clear any accumulated errors and return success
           let type_choice_error_count = self.errors.len() - initial_error_count;
           if type_choice_error_count > 0 {
@@ -1481,6 +1580,7 @@ where
 
         #[cfg(not(feature = "additional-controls"))]
         {
+          self.commit_map_assignment_state(&mut choice_validator);
           // Clear any accumulated errors and return success
           let type_choice_error_count = self.errors.len() - initial_error_count;
           if type_choice_error_count > 0 {
@@ -1705,6 +1805,31 @@ where
       ..
     } = target
     {
+      if let Some((frame_index, arg)) = self.generic_argument_for_identifier(target_ident) {
+        let previous_scope = self.generic_argument_scope;
+        self.generic_argument_scope = Some(frame_index);
+        let resolved_target = Type2::from(arg.clone());
+        let result = if matches!(
+          controller,
+          Type2::Typename {
+            ident: controller_ident,
+            ..
+          } if controller_ident == target_ident
+        ) {
+          self.visit_control_operator(&resolved_target, ctrl, &resolved_target)
+        } else {
+          self.visit_control_operator(&arg.type2, ctrl, controller)
+        };
+        self.generic_argument_scope = previous_scope;
+        return result;
+      }
+    }
+
+    if let Type2::Typename {
+      ident: target_ident,
+      ..
+    } = target
+    {
       if matches!(
         &self.cbor,
         Value::Integer(i)
@@ -1725,6 +1850,34 @@ where
         ..
       } = controller
       {
+        if self.generic_evaluation_stack.is_empty() {
+          if let Some(name) = self.state.eval_generic_rule {
+            if let Some(gr) = self
+              .state
+              .generic_rules
+              .iter()
+              .find(|&gr| gr.name == name)
+              .cloned()
+            {
+              for (idx, gp) in gr.params.iter().enumerate() {
+                if let Some(arg) = gr.args.get(idx) {
+                  if *gp == target_ident.ident {
+                    let t2 = Type2::from(arg.clone());
+
+                    if *gp == controller_ident.ident {
+                      return self.visit_control_operator(&t2, ctrl, &t2);
+                    }
+
+                    return self.visit_control_operator(&arg.type2, ctrl, controller);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if self.generic_evaluation_stack.is_empty() {
         if let Some(name) = self.state.eval_generic_rule {
           if let Some(gr) = self
             .state
@@ -1737,32 +1890,8 @@ where
               if let Some(arg) = gr.args.get(idx) {
                 if *gp == target_ident.ident {
                   let t2 = Type2::from(arg.clone());
-
-                  if *gp == controller_ident.ident {
-                    return self.visit_control_operator(&t2, ctrl, &t2);
-                  }
-
-                  return self.visit_control_operator(&arg.type2, ctrl, controller);
+                  return self.visit_control_operator(&t2, ctrl, controller);
                 }
-              }
-            }
-          }
-        }
-      }
-
-      if let Some(name) = self.state.eval_generic_rule {
-        if let Some(gr) = self
-          .state
-          .generic_rules
-          .iter()
-          .find(|&gr| gr.name == name)
-          .cloned()
-        {
-          for (idx, gp) in gr.params.iter().enumerate() {
-            if let Some(arg) = gr.args.get(idx) {
-              if *gp == target_ident.ident {
-                let t2 = Type2::from(arg.clone());
-                return self.visit_control_operator(&t2, ctrl, controller);
               }
             }
           }
@@ -2118,6 +2247,8 @@ where
 
                     cv.state.generic_rules = self.state.generic_rules.clone();
                     cv.state.eval_generic_rule = self.state.eval_generic_rule;
+                    cv.generic_evaluation_stack = self.generic_evaluation_stack.clone();
+                    cv.generic_argument_scope = self.generic_argument_scope;
                     cv.state.data_location.push_str(&self.state.data_location);
 
                     cv.visit_type2(controller)?;
@@ -2153,6 +2284,8 @@ where
 
                         cv.state.generic_rules = self.state.generic_rules.clone();
                         cv.state.eval_generic_rule = self.state.eval_generic_rule;
+                        cv.generic_evaluation_stack = self.generic_evaluation_stack.clone();
+                        cv.generic_argument_scope = self.generic_argument_scope;
                         let _ = write!(
                           cv.state.data_location,
                           "{}/{}",
@@ -3032,6 +3165,8 @@ where
 
             cv.state.generic_rules = self.state.generic_rules.clone();
             cv.state.eval_generic_rule = self.state.eval_generic_rule;
+            cv.generic_evaluation_stack = self.generic_evaluation_stack.clone();
+            cv.generic_argument_scope = self.generic_argument_scope;
             cv.state.is_multi_type_choice = self.state.is_multi_type_choice;
             cv.state.is_multi_group_choice = self.state.is_multi_group_choice;
             cv.state.data_location.push_str(&self.state.data_location);
@@ -3077,6 +3212,8 @@ where
 
             cv.state.generic_rules = self.state.generic_rules.clone();
             cv.state.eval_generic_rule = self.state.eval_generic_rule;
+            cv.generic_evaluation_stack = self.generic_evaluation_stack.clone();
+            cv.generic_argument_scope = self.generic_argument_scope;
             cv.state.is_multi_type_choice = self.state.is_multi_type_choice;
             cv.state.is_multi_group_choice = self.state.is_multi_group_choice;
             cv.state.data_location.push_str(&self.state.data_location);
@@ -3129,6 +3266,8 @@ where
 
               cv.state.generic_rules = self.state.generic_rules.clone();
               cv.state.eval_generic_rule = self.state.eval_generic_rule;
+              cv.generic_evaluation_stack = self.generic_evaluation_stack.clone();
+              cv.generic_argument_scope = self.generic_argument_scope;
               cv.state.is_multi_type_choice = self.state.is_multi_type_choice;
               cv.state.is_multi_group_choice = self.state.is_multi_group_choice;
               cv.state.data_location.push_str(&self.state.data_location);
@@ -3244,6 +3383,8 @@ where
 
             cv.state.generic_rules = self.state.generic_rules.clone();
             cv.state.eval_generic_rule = self.state.eval_generic_rule;
+            cv.generic_evaluation_stack = self.generic_evaluation_stack.clone();
+            cv.generic_argument_scope = self.generic_argument_scope;
             cv.state.is_multi_type_choice = self.state.is_multi_type_choice;
             cv.state.is_multi_group_choice = self.state.is_multi_group_choice;
             cv.state.data_location.push_str(&self.state.data_location);
@@ -3308,10 +3449,16 @@ where
 
             cv.state.generic_rules = self.state.generic_rules.clone();
             cv.state.eval_generic_rule = Some(ident.ident);
+            cv.generic_evaluation_stack = self.generic_evaluation_stack.clone();
+            cv.push_generic_evaluation(ident.ident, rule, ga);
             cv.state.is_group_to_choice_enum = true;
             cv.state.is_multi_type_choice = self.state.is_multi_type_choice;
+            cv.inherit_map_assignment_state(self);
             cv.visit_rule(rule)?;
 
+            if cv.errors.is_empty() {
+              self.commit_map_assignment_state(&mut cv);
+            }
             self.errors.append(&mut cv.errors);
 
             return Ok(());
@@ -3379,9 +3526,15 @@ where
 
             cv.state.generic_rules = self.state.generic_rules.clone();
             cv.state.eval_generic_rule = Some(ident.ident);
+            cv.generic_evaluation_stack = self.generic_evaluation_stack.clone();
+            cv.push_generic_evaluation(ident.ident, rule, ga);
             cv.state.is_multi_type_choice = self.state.is_multi_type_choice;
+            cv.inherit_map_assignment_state(self);
             cv.visit_rule(rule)?;
 
+            if cv.errors.is_empty() {
+              self.commit_map_assignment_state(&mut cv);
+            }
             self.errors.append(&mut cv.errors);
 
             return Ok(());
@@ -3448,9 +3601,15 @@ where
 
             cv.state.generic_rules = self.state.generic_rules.clone();
             cv.state.eval_generic_rule = Some(ident.ident);
+            cv.generic_evaluation_stack = self.generic_evaluation_stack.clone();
+            cv.push_generic_evaluation(ident.ident, rule, ga);
             cv.state.is_multi_type_choice = self.state.is_multi_type_choice;
+            cv.inherit_map_assignment_state(self);
             cv.visit_rule(rule)?;
 
+            if cv.errors.is_empty() {
+              self.commit_map_assignment_state(&mut cv);
+            }
             self.errors.append(&mut cv.errors);
 
             return Ok(());
@@ -3509,6 +3668,8 @@ where
 
           cv.state.generic_rules = self.state.generic_rules.clone();
           cv.state.eval_generic_rule = self.state.eval_generic_rule;
+          cv.generic_evaluation_stack = self.generic_evaluation_stack.clone();
+          cv.generic_argument_scope = self.generic_argument_scope;
           cv.state.is_multi_type_choice = self.state.is_multi_type_choice;
           cv.state.is_multi_group_choice = self.state.is_multi_group_choice;
           cv.state.data_location.push_str(&self.state.data_location);
@@ -3784,18 +3945,28 @@ where
   }
 
   fn visit_identifier(&mut self, ident: &Identifier<'a>) -> visitor::Result<Error<T>> {
-    if let Some(name) = self.state.eval_generic_rule {
-      if let Some(gr) = self
-        .state
-        .generic_rules
-        .iter()
-        .find(|&gr| gr.name == name)
-        .cloned()
-      {
-        for (idx, gp) in gr.params.iter().enumerate() {
-          if *gp == ident.ident {
-            if let Some(arg) = gr.args.get(idx) {
-              return self.visit_type1(arg);
+    if let Some((frame_index, arg)) = self.generic_argument_for_identifier(ident) {
+      let previous_scope = self.generic_argument_scope;
+      self.generic_argument_scope = Some(frame_index);
+      let result = self.visit_type1(&arg);
+      self.generic_argument_scope = previous_scope;
+      return result;
+    }
+
+    if self.generic_evaluation_stack.is_empty() {
+      if let Some(name) = self.state.eval_generic_rule {
+        if let Some(gr) = self
+          .state
+          .generic_rules
+          .iter()
+          .find(|&gr| gr.name == name)
+          .cloned()
+        {
+          for (idx, gp) in gr.params.iter().enumerate() {
+            if *gp == ident.ident {
+              if let Some(arg) = gr.args.get(idx) {
+                return self.visit_type1(arg);
+              }
             }
           }
         }
@@ -4269,6 +4440,8 @@ where
 
       cv.state.generic_rules = self.state.generic_rules.clone();
       cv.state.eval_generic_rule = self.state.eval_generic_rule;
+      cv.generic_evaluation_stack = self.generic_evaluation_stack.clone();
+      cv.generic_argument_scope = self.generic_argument_scope;
       cv.state.is_multi_type_choice = self.state.is_multi_type_choice;
       cv.state.is_multi_group_choice = self.state.is_multi_group_choice;
       cv.state.data_location.push_str(&self.state.data_location);
@@ -4370,6 +4543,8 @@ where
 
         cv.state.generic_rules = self.state.generic_rules.clone();
         cv.state.eval_generic_rule = Some(entry.name.ident);
+        cv.generic_evaluation_stack = self.generic_evaluation_stack.clone();
+        cv.push_generic_evaluation(entry.name.ident, rule, ga);
         if let Some(rule) = cv
           .state
           .generic_rules
