@@ -2897,9 +2897,9 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
           #[cfg(feature = "ast-span")]
           if let Occur::ZeroOrMore { .. } | Occur::OneOrMore { .. } = occur {
             if let Occur::OneOrMore { .. } = occur {
-              if o.is_empty() {
+              if self.values_to_validate.as_ref().is_none_or(Vec::is_empty) {
                 self.add_error(format!(
-                  "object cannot be empty, one or more entries with key type {} required",
+                  "object has no unconsumed entries, one or more entries with key type {} required",
                   ident
                 ));
                 return Ok(());
@@ -2954,9 +2954,9 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
           #[cfg(not(feature = "ast-span"))]
           if let Occur::ZeroOrMore {} | Occur::OneOrMore {} = occur {
             if let Occur::OneOrMore {} = occur {
-              if o.is_empty() {
+              if self.values_to_validate.as_ref().is_none_or(Vec::is_empty) {
                 self.add_error(format!(
-                  "object cannot be empty, one or more entries with key type {} required",
+                  "object has no unconsumed entries, one or more entries with key type {} required",
                   ident
                 ));
                 return Ok(());
@@ -3119,9 +3119,8 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
 
     if let Some(ga) = &entry.generic_args {
       if let Some(rule) = rule_from_ident(self.state.cddl, &entry.name) {
-        if let Some(gr) = self
-          .state
-          .generic_rules
+        let mut child_generic_rules = self.state.generic_rules.clone();
+        if let Some(gr) = child_generic_rules
           .iter_mut()
           .find(|gr| gr.name == entry.name.ident)
         {
@@ -3130,7 +3129,7 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
           }
         } else if let Some(params) = generic_params_from_rule(rule) {
           let args_vec: Vec<Type1> = ga.args.iter().cloned().map(|arg| *arg.arg).collect();
-          self.state.generic_rules.push(GenericRule {
+          child_generic_rules.push(GenericRule {
             name: entry.name.ident,
             params,
             args: args_vec,
@@ -3152,21 +3151,31 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
         #[cfg(not(feature = "additional-controls"))]
         let mut jv = JSONValidator::new(self.state.cddl, self.json.clone());
 
-        jv.state.generic_rules = self.state.generic_rules.clone();
+        jv.state.generic_rules = child_generic_rules;
         jv.state.eval_generic_rule = Some(entry.name.ident);
+        if let Some(rule) = jv
+          .state
+          .generic_rules
+          .iter_mut()
+          .find(|rule| rule.name == entry.name.ident)
+        {
+          let current_args_start = rule.args.len().saturating_sub(rule.params.len());
+          rule.args = rule.args[current_args_start..].to_vec();
+        }
         jv.state.is_multi_type_choice = self.state.is_multi_type_choice;
+        jv.state.is_multi_group_choice = self.state.is_multi_group_choice;
+        // A named generic group expands into the enclosing map rather than a
+        // fresh object (RFC 8610 Appendix C). Let the child see the parent's
+        // current unique-string ownership ledger, then replace the ledger only
+        // after the complete child succeeds so failed alternatives roll back.
+        jv.validated_keys = self.validated_keys.clone();
         jv.visit_rule(rule)?;
 
-        self.errors.append(&mut jv.errors);
-
-        // The child validated the same object in the same group context, so
-        // keys it consumed count toward this validator's unexpected-key check
-        if let Some(keys) = jv.validated_keys {
-          self
-            .validated_keys
-            .get_or_insert_with(Vec::new)
-            .extend(keys);
+        let child_succeeded = jv.errors.is_empty();
+        if child_succeeded {
+          self.validated_keys = jv.validated_keys.take();
         }
+        self.errors.append(&mut jv.errors);
 
         return Ok(());
       }
