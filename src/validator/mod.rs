@@ -128,7 +128,8 @@ pub struct ValidationState<'a> {
   /// Whether or not to advance to the next group entry if member key
   /// validation fails as detected during the current state of AST evaluation
   pub advance_to_next_entry: bool,
-  /// Is validation checking for map equality
+  /// Legacy map-equality traversal flag retained for API compatibility.
+  /// Composite controls no longer set or consult this field.
   pub is_ctrl_map_equality: bool,
   /// Is colon shortcut present in member key
   pub is_colon_shortcut_present: bool,
@@ -1161,11 +1162,10 @@ pub fn is_ident_byte_string_data_type(cddl: &CDDL, ident: &Identifier) -> bool {
   })
 }
 
-/// Retrieve number of group entries from a group. This is currently only used
-/// for determining map equality/inequality (the `.eq`/`.ne` control
-/// operators), but may be useful in other contexts. The occurrence is only
-/// captured for the second entry of the group choice to avoid ambiguity in
-/// non-homogenous definitions
+/// Retrieve number of group entries from a group for callers that need a
+/// static count estimate. Aggregate equality uses complete isolated matching
+/// instead. The occurrence is only captured for the second entry of the group
+/// choice to avoid ambiguity in non-homogenous definitions.
 pub fn entry_counts_from_group<'a, 'b: 'a>(
   cddl: &'a CDDL,
   group: &'b Group<'a>,

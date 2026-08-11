@@ -170,6 +170,10 @@ pub struct JSONValidator<'a> {
   // The group entry takes this relay immediately and commits only candidates
   // whose values also match the member.
   map_entry_candidates: Option<Vec<(String, Value)>>,
+  // Literal numeric comparison inside an aggregate `.eq`, `.ne`, or
+  // `.default` controller must preserve the integer/float distinction from
+  // RFC 8610 Section 3.8.6. Ordinary JSON number validation stays unchanged.
+  is_composite_equality_probe: bool,
 }
 
 impl<'a> JSONValidator<'a> {
@@ -185,6 +189,7 @@ impl<'a> JSONValidator<'a> {
       cut_value: None,
       validated_keys: None,
       map_entry_candidates: None,
+      is_composite_equality_probe: false,
     }
   }
 
@@ -200,6 +205,7 @@ impl<'a> JSONValidator<'a> {
       cut_value: None,
       validated_keys: None,
       map_entry_candidates: None,
+      is_composite_equality_probe: false,
     }
   }
 
@@ -214,7 +220,58 @@ impl<'a> JSONValidator<'a> {
     jv.state.generic_rules = self.state.generic_rules.clone();
     jv.state.eval_generic_rule = self.state.eval_generic_rule;
     jv.state.visited_rules = self.state.visited_rules.clone();
+    jv.is_composite_equality_probe = self.is_composite_equality_probe;
     jv
+  }
+
+  fn isolated_type2_probe(&self) -> JSONValidator<'a> {
+    let mut probe = self.new_with_recursion_state(self.json.clone());
+    probe.state.is_multi_type_choice = self.state.is_multi_type_choice;
+    probe.state.is_multi_group_choice = self.state.is_multi_group_choice;
+    probe
+      .state
+      .data_location
+      .clone_from(&self.state.data_location);
+    probe.state.type_group_name_entry = self.state.type_group_name_entry;
+    probe
+  }
+
+  fn validate_composite_control(
+    &mut self,
+    target: &Type2<'a>,
+    ctrl: ControlOperator,
+    controller: &Type2<'a>,
+  ) -> visitor::Result<Error> {
+    // The control is an intersection: membership in the complete target is
+    // authoritative even when the aggregate differs from the controller.
+    let mut target_probe = self.isolated_type2_probe();
+    target_probe.visit_type2(target)?;
+    if !target_probe.errors.is_empty() {
+      self.errors.append(&mut target_probe.errors);
+      return Ok(());
+    }
+
+    // Controller matching is speculative and owns its own map ledger. Its
+    // errors are a Boolean equality result, not partial parent validation.
+    let mut equality_probe = self.isolated_type2_probe();
+    equality_probe.is_composite_equality_probe = true;
+    equality_probe.visit_type2(controller)?;
+    let equal = equality_probe.errors.is_empty();
+
+    match ctrl {
+      ControlOperator::EQ if !equal => self.errors.append(&mut equality_probe.errors),
+      ControlOperator::NE if equal => self.add_error(format!(
+        "expected aggregate value {} to differ from {}",
+        self.json, controller
+      )),
+      ControlOperator::DEFAULT if equal => self.add_error(format!(
+        "default aggregate value {} must be omitted",
+        controller
+      )),
+      _ => {}
+    }
+
+    Ok(())
   }
 
   fn repeating_member_upper_bound(entry: &ValueMemberKeyEntry<'a>) -> Option<usize> {
@@ -276,6 +333,7 @@ impl<'a> JSONValidator<'a> {
       cut_value: None,
       validated_keys: None,
       map_entry_candidates: None,
+      is_composite_equality_probe: false,
     }
   }
 
@@ -291,6 +349,7 @@ impl<'a> JSONValidator<'a> {
       cut_value: None,
       validated_keys: None,
       map_entry_candidates: None,
+      is_composite_equality_probe: false,
     }
   }
 
@@ -908,16 +967,7 @@ impl<'a> JSONValidator<'a> {
       None => return Ok(None),
     };
 
-    #[cfg(all(feature = "additional-controls", target_arch = "wasm32"))]
-    let mut jv = JSONValidator::new(self.state.cddl, value, self.state.enabled_features.clone());
-    #[cfg(all(feature = "additional-controls", not(target_arch = "wasm32")))]
-    let mut jv = JSONValidator::new(self.state.cddl, value, self.state.enabled_features);
-    #[cfg(not(feature = "additional-controls"))]
-    let mut jv = JSONValidator::new(self.state.cddl, value);
-
-    jv.state.generic_rules = self.state.generic_rules.clone();
-    jv.state.eval_generic_rule = self.state.eval_generic_rule;
-    jv.state.visited_rules = self.state.visited_rules.clone();
+    let mut jv = self.new_with_recursion_state(value);
     jv.state.ctrl = self.state.ctrl;
     let _ = write!(
       jv.state.data_location,
@@ -1180,54 +1230,6 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
     if g.group_choices.len() > 1 {
       self.state.is_multi_group_choice = true;
     }
-
-    // Map equality/inequality validation
-    if self.state.is_ctrl_map_equality {
-      if let Some(t) = &self.state.ctrl {
-        if let Value::Object(o) = &self.json {
-          let entry_counts = entry_counts_from_group(self.state.cddl, g);
-
-          let len = o.len();
-          if let ControlOperator::EQ = t {
-            if !validate_entry_count(&entry_counts, len) {
-              for ec in entry_counts.iter() {
-                if let Some(occur) = &ec.entry_occurrence {
-                  self.add_error(format!(
-                    "map equality error. expected object with number of entries per occurrence {}",
-                    occur,
-                  ));
-                } else {
-                  self.add_error(format!(
-                    "map equality error, expected object with length {}, got {}",
-                    ec.count, len
-                  ));
-                }
-              }
-              return Ok(());
-            }
-          } else if let ControlOperator::NE | ControlOperator::DEFAULT = t {
-            if !validate_entry_count(&entry_counts, len) {
-              for ec in entry_counts.iter() {
-                if let Some(occur) = &ec.entry_occurrence {
-                  self.add_error(format!(
-                    "map inequality error. expected object with number of entries not per occurrence {}",
-                    occur,
-                  ));
-                } else {
-                  self.add_error(format!(
-                    "map inequality error, expected object not with length {}, got {}",
-                    ec.count, len
-                  ));
-                }
-              }
-              return Ok(());
-            }
-          }
-        }
-      }
-    }
-
-    self.state.is_ctrl_map_equality = false;
 
     let initial_error_count = self.errors.len();
     for group_choice in g.group_choices.iter() {
@@ -1512,21 +1514,8 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
             return self.visit_type2(controller);
           }
         }
-        Type2::Array { .. } => {
-          if let Value::Array(_) = &self.json {
-            self.visit_type2(controller)?;
-            return Ok(());
-          }
-        }
-        Type2::Map { .. } => {
-          if let Value::Object(_) = &self.json {
-            self.state.ctrl = Some(ctrl);
-            self.state.is_ctrl_map_equality = true;
-            self.visit_type2(controller)?;
-            self.state.ctrl = None;
-            self.state.is_ctrl_map_equality = false;
-            return Ok(());
-          }
+        Type2::Array { .. } | Type2::Map { .. } => {
+          return self.validate_composite_control(target, ctrl, controller);
         }
         _ => self.add_error(format!(
           "target for .eq operator must be a string, numerical, array or map data type, got {}",
@@ -1544,23 +1533,8 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
             return Ok(());
           }
         }
-        Type2::Array { .. } => {
-          if let Value::Array(_) = &self.json {
-            self.state.ctrl = Some(ctrl);
-            self.visit_type2(controller)?;
-            self.state.ctrl = None;
-            return Ok(());
-          }
-        }
-        Type2::Map { .. } => {
-          if let Value::Object(_) = &self.json {
-            self.state.ctrl = Some(ctrl);
-            self.state.is_ctrl_map_equality = true;
-            self.visit_type2(controller)?;
-            self.state.ctrl = None;
-            self.state.is_ctrl_map_equality = false;
-            return Ok(());
-          }
+        Type2::Array { .. } | Type2::Map { .. } => {
+          return self.validate_composite_control(target, ctrl, controller);
         }
         _ => self.add_error(format!(
           "target for .ne operator must be a string, numerical, array or map data type, got {}",
@@ -1624,6 +1598,10 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
         self.state.ctrl = None;
       }
       ControlOperator::DEFAULT => {
+        if matches!(target, Type2::Array { .. } | Type2::Map { .. }) {
+          return self.validate_composite_control(target, ctrl, controller);
+        }
+
         self.state.ctrl = Some(ctrl);
         let error_count = self.errors.len();
         self.visit_type2(target)?;
@@ -3066,6 +3044,7 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
       jv.state.is_multi_group_choice = self.state.is_multi_group_choice;
       jv.state.data_location.push_str(&self.state.data_location);
       jv.state.type_group_name_entry = self.state.type_group_name_entry;
+      jv.is_composite_equality_probe = self.is_composite_equality_probe;
       jv.visit_type(&entry.entry_type)?;
 
       self.state.data_location = current_location;
@@ -3317,6 +3296,10 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
         _ => Some(format!("expected value {}, got {}", v, self.json)),
       },
       token::Value::FLOAT(v) => match &self.json {
+        Value::Number(n) if self.is_composite_equality_probe && !n.is_f64() => Some(format!(
+          "expected floating-point value {}, got integer {}",
+          v, n
+        )),
         Value::Number(n) => match n.as_f64() {
           Some(f) => match &self.state.ctrl {
             Some(ControlOperator::NE) | Some(ControlOperator::DEFAULT)
