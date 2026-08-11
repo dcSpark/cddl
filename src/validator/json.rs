@@ -264,6 +264,14 @@ impl<'a> JSONValidator<'a> {
     }
   }
 
+  fn member_key_has_cut(entry: &ValueMemberKeyEntry<'a>) -> bool {
+    matches!(
+      entry.member_key.as_ref(),
+      Some(MemberKey::Bareword { .. } | MemberKey::Value { .. })
+        | Some(MemberKey::Type1 { is_cut: true, .. })
+    )
+  }
+
   #[cfg(target_arch = "wasm32")]
   #[cfg(feature = "additional-controls")]
   /// New JSONValidation from CDDL AST and JSON value
@@ -2997,6 +3005,20 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
     }
 
     let current_location = self.state.data_location.clone();
+    let entry_checkpoint = if entry
+      .occur
+      .as_ref()
+      .is_some_and(|occur| matches!(occur.occur, Occur::Optional { .. }))
+      && !Self::member_key_has_cut(entry)
+    {
+      Some((
+        self.state.clone(),
+        self.validated_keys.clone(),
+        self.cut_value.clone(),
+      ))
+    } else {
+      None
+    };
 
     let (map_entry_candidates, object_value) = if let Some(mk) = &entry.member_key {
       let error_count = self.errors.len();
@@ -3068,9 +3090,21 @@ impl<'a> Visitor<'a, '_, Error> for JSONValidator<'a> {
       jv.state.type_group_name_entry = self.state.type_group_name_entry;
       jv.visit_type(&entry.entry_type)?;
 
-      self.state.data_location = current_location;
+      if jv.errors.is_empty() {
+        self.state.data_location = current_location;
+      } else if let Some((entry_state, entry_validated_keys, entry_cut_value)) = entry_checkpoint {
+        // A non-cut optional member matches a complete key/value pair. If its
+        // value fails, take the zero-width path and leave the key available
+        // to a later group entry (RFC 8610 Section 3.5.4).
+        self.state = entry_state;
+        self.state.advance_to_next_entry = true;
+        self.validated_keys = entry_validated_keys;
+        self.cut_value = entry_cut_value;
+      } else {
+        self.state.data_location = current_location;
+        self.errors.append(&mut jv.errors);
+      }
 
-      self.errors.append(&mut jv.errors);
       if entry.occur.is_some() {
         self.state.occurrence = None;
       }
